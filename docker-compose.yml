@@ -1,0 +1,22 @@
+services:
+  bot:
+    build: .
+    container_name: tgstream-bot
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - ./data:/app/data
+    command: python bot.py
+
+  auth:
+    build: .
+    container_name: tgstream-auth
+    profiles: ["auth"]
+    env_file:
+      - .env
+    stdin_open: true
+    tty: true
+    volumes:
+      - ./data:/app/data
+    command: python create_session.py
