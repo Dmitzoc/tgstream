@@ -7,12 +7,15 @@ from typing import Dict, List, Optional, Set
 
 from dotenv import load_dotenv
 from pyrogram import Client, filters
-from pyrogram.enums import ChatMemberStatus
+from pyrogram.enums import ChatMemberStatus, ChatType
 from pyrogram.types import Message
 from pytgcalls import PyTgCalls
-from pytgcalls.types import AudioQuality, MediaStream, StreamAudioEnded
-from pytgcalls.types.input_stream import AudioPiped
 from yt_dlp import YoutubeDL
+
+try:
+    from pytgcalls.types import StreamAudioEnded
+except Exception:
+    StreamAudioEnded = None
 
 
 load_dotenv()
@@ -177,13 +180,7 @@ async def start_or_enqueue(chat_id: int, track: Track, calls: PyTgCalls, bot: Cl
 
 
 async def play_track(calls: PyTgCalls, chat_id: int, track: Track) -> None:
-    await calls.play(
-        chat_id,
-        MediaStream(
-            AudioPiped(track.direct_url),
-            audio_parameters=AudioQuality.HIGH,
-        ),
-    )
+    await calls.play(chat_id, track.direct_url)
 
 
 async def reconnect_worker(chat_id: int, calls: PyTgCalls, bot: Client) -> None:
@@ -209,6 +206,9 @@ async def reconnect_worker(chat_id: int, calls: PyTgCalls, bot: Client) -> None:
                 return
             except Exception as exc:
                 logger.warning("Reconnect attempt %s failed for chat %s: %s", attempt, chat_id, exc)
+                if "valid stream object" in str(exc) or "stream classes found" in str(exc):
+                    active_calls[chat_id] = False
+                    return
                 await asyncio.sleep(RECONNECT_DELAY_SECONDS)
     finally:
         reconnect_tasks.pop(chat_id, None)
@@ -269,6 +269,13 @@ async def is_privileged_user(bot: Client, m: Message) -> bool:
     }
 
 
+async def ensure_group_context(m: Message) -> bool:
+    if m.chat.type in (ChatType.GROUP, ChatType.SUPERGROUP):
+        return True
+    await m.reply_text("Эта команда работает только в группе с активным голосовым чатом.")
+    return False
+
+
 def build_clients() -> tuple[Client, Client, PyTgCalls]:
     bot_client = Client(
         name="music_bot",
@@ -282,6 +289,7 @@ def build_clients() -> tuple[Client, Client, PyTgCalls]:
         name=user_session_path,
         api_id=API_ID,
         api_hash=API_HASH,
+        no_updates=True,
     )
     call_client = PyTgCalls(user_client)
     return bot_client, user_client, call_client
@@ -289,10 +297,17 @@ def build_clients() -> tuple[Client, Client, PyTgCalls]:
 
 def main() -> None:
     bot, user, calls = build_clients()
+    logger.info(
+        "Stream backend: url_play=True StreamAudioEnded=%s",
+        bool(StreamAudioEnded),
+    )
 
     @calls.on_update()
     async def stream_end_handler(_, update):
-        if isinstance(update, StreamAudioEnded):
+        if StreamAudioEnded is not None and isinstance(update, StreamAudioEnded):
+            await play_next(update.chat_id, calls, bot)
+            return
+        if update.__class__.__name__ == "StreamAudioEnded" and hasattr(update, "chat_id"):
             await play_next(update.chat_id, calls, bot)
 
     @bot.on_message(filters.command("start"))
@@ -314,8 +329,10 @@ def main() -> None:
     async def ping_cmd(_, m: Message):
         await m.reply_text("pong")
 
-    @bot.on_message(filters.command("play") & filters.group)
+    @bot.on_message(filters.command("play"))
     async def play_cmd(_, m: Message):
+        if not await ensure_group_context(m):
+            return
         if len(m.command) < 2:
             await m.reply_text("Использование: /play <название трека>")
             return
@@ -329,8 +346,10 @@ def main() -> None:
         except Exception as exc:
             await m.reply_text(f"Ошибка поиска/добавления: {exc}")
 
-    @bot.on_message(filters.command("skip") & filters.group)
+    @bot.on_message(filters.command("skip"))
     async def skip_cmd(_, m: Message):
+        if not await ensure_group_context(m):
+            return
         if not await is_privileged_user(bot, m):
             await m.reply_text("Недостаточно прав для /skip.")
             return
@@ -340,8 +359,10 @@ def main() -> None:
         await play_next(m.chat.id, calls, bot)
         await m.reply_text("Трек пропущен.")
 
-    @bot.on_message(filters.command("reconnect") & filters.group)
+    @bot.on_message(filters.command("reconnect"))
     async def reconnect_cmd(_, m: Message):
+        if not await ensure_group_context(m):
+            return
         if not await is_privileged_user(bot, m):
             await m.reply_text("Недостаточно прав для /reconnect.")
             return
@@ -351,8 +372,10 @@ def main() -> None:
         ensure_reconnect(m.chat.id, calls, bot)
         await m.reply_text("Запущен реконнект.")
 
-    @bot.on_message(filters.command("queue") & filters.group)
+    @bot.on_message(filters.command("queue"))
     async def queue_cmd(_, m: Message):
+        if not await ensure_group_context(m):
+            return
         items = await queue.list(m.chat.id)
         if not items:
             await m.reply_text("Очередь пуста.")
@@ -364,8 +387,10 @@ def main() -> None:
             lines.append(f"... и еще {len(items) - 20}")
         await m.reply_text("\n".join(lines))
 
-    @bot.on_message(filters.command("now") & filters.group)
+    @bot.on_message(filters.command("now"))
     async def now_cmd(_, m: Message):
+        if not await ensure_group_context(m):
+            return
         tr = current_track.get(m.chat.id)
         if not tr:
             await m.reply_text("Сейчас ничего не играет.")
@@ -377,8 +402,10 @@ def main() -> None:
             f"Запросил: {tr.requested_by}"
         )
 
-    @bot.on_message(filters.command("stop") & filters.group)
+    @bot.on_message(filters.command("stop"))
     async def stop_cmd(_, m: Message):
+        if not await ensure_group_context(m):
+            return
         await queue.clear(m.chat.id)
         active_calls[m.chat.id] = False
         current_track.pop(m.chat.id, None)

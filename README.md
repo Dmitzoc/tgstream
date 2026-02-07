@@ -59,7 +59,7 @@ cp .env.example .env
 ### 1. Создать user-сессию (один раз)
 
 ```bash
-sudo docker compose run --rm auth
+sudo docker-compose run --rm auth
 ```
 
 Введи номер телефона, код Telegram и 2FA-пароль (если включен).  
@@ -68,8 +68,8 @@ sudo docker compose run --rm auth
 ### 2. Запустить бота
 
 ```bash
-sudo docker compose up -d --build bot
-sudo docker compose logs -f bot
+sudo docker-compose up -d --build bot
+sudo docker-compose logs -f bot
 ```
 
 ## Обновление
@@ -77,7 +77,7 @@ sudo docker compose logs -f bot
 ```bash
 cd /opt/tgstream
 # обновите файлы проекта
-sudo docker compose up -d --build bot
+sudo docker-compose up -d --build bot
 ```
 
 ## Подготовка группы
@@ -87,3 +87,4 @@ sudo docker compose up -d --build bot
 3. Дай userbot право входить в голосовой чат
 4. Запусти голосовой чат
 5. Запусти `/play <название>`
+
