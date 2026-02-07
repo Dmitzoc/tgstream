@@ -1,35 +1,29 @@
-# Telegram Music Stream Bot (VPS-ready)
+# Telegram Music Stream Bot (voice chat, VPS-ready)
 
-Бот ищет музыку по названию и стримит ее в голосовой чат Telegram через `yt-dlp`.
+Бот ищет музыку по названию и стримит ее в групповой звонок Telegram.
 
-## Возможности
+## Важный момент
 
-- `/play <название>`: поиск и добавление трека в очередь
-- `/skip`: пропустить текущий трек
-- `/queue`: показать очередь
-- `/now`: текущий трек
-- `/stop`: остановить и очистить очередь
-- `/ping`: проверка, что бот жив
+Полноценный стрим в voice chat нельзя сделать только через Bot API.  
+Рабочая схема для звонка: бот для команд + userbot-сессия для подключения к звонку.
 
-## Архитектура
+В этом проекте это уже реализовано:
+- `BOT_TOKEN` принимает команды
+- userbot (обычный аккаунт Telegram) заходит в голосовой чат и стримит аудио
 
-- `BOT_TOKEN` (бот) принимает команды в группе
-- userbot-сессия (обычный Telegram-аккаунт) подключается к voice chat и стримит аудио
+## Команды
 
-Это ограничение Telegram: бот сам по себе не может стримить в звонок без user-сессии.
+- `/play <название>` - поиск и добавление в очередь
+- `/skip` - пропустить текущий трек
+- `/reconnect` - вручную запустить реконнект
+- `/queue` - показать очередь
+- `/now` - текущий трек
+- `/stop` - остановить и очистить очередь
+- `/ping` - healthcheck
 
-## Файлы проекта
+## Переменные окружения
 
-- `bot.py` - основной бот
-- `create_session.py` - одноразовое создание user-сессии
-- `docker-compose.yml` - прод-запуск в контейнере
-- `deploy/tgstream.service` - вариант запуска через `systemd`
-
-## 1) Подготовка переменных
-
-1. Получите `API_ID` и `API_HASH` на `https://my.telegram.org`
-2. Создайте бота через `@BotFather`, получите `BOT_TOKEN`
-3. Создайте `.env`:
+Создай `.env`:
 
 ```env
 API_ID=123456
@@ -38,13 +32,16 @@ BOT_TOKEN=123456:ABCDEF
 SESSION_NAME=music_user
 SESSION_DIR=data/sessions
 LOG_LEVEL=INFO
+PRIVILEGED_USER_IDS=123456789,987654321
+RECONNECT_DELAY_SECONDS=8
+RECONNECT_MAX_ATTEMPTS=0
 ```
 
-Можно скопировать из `.env.example`.
+`PRIVILEGED_USER_IDS` - список user id через запятую, которым разрешен `/skip` и `/reconnect`.  
+Админы группы тоже могут использовать `/skip` и `/reconnect`.  
+`RECONNECT_MAX_ATTEMPTS=0` означает бесконечные попытки реконнекта.
 
-## 2) Рекомендуемый деплой на VPS через Docker
-
-Ниже команды для Ubuntu 22.04/24.04.
+## Деплой на VPS через Docker
 
 ```bash
 sudo apt update
@@ -54,30 +51,28 @@ sudo systemctl enable --now docker
 mkdir -p /opt/tgstream
 cd /opt/tgstream
 # скопируйте сюда файлы проекта
+
+cp .env.example .env
+# заполните .env
 ```
 
-### Первый запуск: создать user-сессию
+### 1. Создать user-сессию (один раз)
 
 ```bash
-cd /opt/tgstream
-cp .env.example .env
-# заполните .env своими значениями
-
 sudo docker compose run --rm auth
 ```
 
-Команда попросит номер телефона, код Telegram и (если включено) 2FA-пароль.  
-После этого в `data/sessions` появится файл сессии.
+Введи номер телефона, код Telegram и 2FA-пароль (если включен).  
+После этого сессия сохранится в `data/sessions`.
 
-### Запуск бота
+### 2. Запустить бота
 
 ```bash
-cd /opt/tgstream
 sudo docker compose up -d --build bot
 sudo docker compose logs -f bot
 ```
 
-### Обновление
+## Обновление
 
 ```bash
 cd /opt/tgstream
@@ -85,49 +80,10 @@ cd /opt/tgstream
 sudo docker compose up -d --build bot
 ```
 
-## 3) Альтернатива: systemd + venv (без Docker)
+## Подготовка группы
 
-```bash
-sudo apt update
-sudo apt install -y python3 python3-venv ffmpeg
-
-sudo useradd -r -m -d /opt/tgstream -s /usr/sbin/nologin tgstream || true
-sudo mkdir -p /opt/tgstream
-sudo chown -R tgstream:tgstream /opt/tgstream
-```
-
-Далее в `/opt/tgstream`:
-
-```bash
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -U pip
-pip install -r requirements.txt
-cp .env.example .env
-# заполните .env
-python create_session.py
-```
-
-Установка сервиса:
-
-```bash
-sudo cp deploy/tgstream.service /etc/systemd/system/tgstream.service
-sudo systemctl daemon-reload
-sudo systemctl enable --now tgstream
-sudo systemctl status tgstream
-sudo journalctl -u tgstream -f
-```
-
-## Подготовка в Telegram-группе
-
-1. Добавьте бота в группу
-2. Добавьте userbot-аккаунт в группу
-3. Дайте userbot право входить в голосовой чат
-4. Запустите voice chat в группе
-5. Используйте `/play <название>`
-
-## Частые проблемы
-
-- `Failed to start playback`: обычно voice chat не запущен или userbot не имеет права в него зайти
-- Не создается сессия: проверьте `API_ID`/`API_HASH` и входные данные Telegram
-- Нет звука: проверьте, что на VPS установлен `ffmpeg` (в Docker уже включен)
+1. Добавь бота в группу
+2. Добавь userbot-аккаунт (которым создана сессия) в эту же группу
+3. Дай userbot право входить в голосовой чат
+4. Запусти голосовой чат
+5. Запусти `/play <название>`

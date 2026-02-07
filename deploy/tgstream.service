@@ -1,0 +1,17 @@
+[Unit]
+Description=Telegram Music Stream Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/tgstream
+EnvironmentFile=/opt/tgstream/.env
+ExecStart=/opt/tgstream/.venv/bin/python /opt/tgstream/bot.py
+Restart=always
+RestartSec=5
+User=tgstream
+Group=tgstream
+
+[Install]
+WantedBy=multi-user.target

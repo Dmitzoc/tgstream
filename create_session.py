@@ -19,7 +19,7 @@ Path(SESSION_DIR).mkdir(parents=True, exist_ok=True)
 session_path = str(Path(SESSION_DIR) / SESSION_NAME)
 
 print(f"Creating Telegram user session: {session_path}")
-print("Enter phone and login code when prompted.")
+print("Enter phone number and code when prompted.")
 
 app = Client(
     name=session_path,
@@ -29,4 +29,4 @@ app = Client(
 
 with app:
     me = app.get_me()
-    print(f"Session is ready for: {me.first_name} (@{me.username or 'no_username'})")
+    print(f"Session created for: {me.first_name} (@{me.username or 'no_username'})")

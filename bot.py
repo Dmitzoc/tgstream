@@ -3,10 +3,11 @@ import logging
 import os
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Set
 
 from dotenv import load_dotenv
 from pyrogram import Client, filters
+from pyrogram.enums import ChatMemberStatus
 from pyrogram.types import Message
 from pytgcalls import PyTgCalls
 from pytgcalls.types import AudioQuality, MediaStream, StreamAudioEnded
@@ -29,11 +30,32 @@ API_HASH = os.getenv("API_HASH", "")
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 SESSION_NAME = os.getenv("SESSION_NAME", "music_user")
 SESSION_DIR = os.getenv("SESSION_DIR", "data/sessions")
+PRIVILEGED_USER_IDS_RAW = os.getenv("PRIVILEGED_USER_IDS", "")
+RECONNECT_DELAY_SECONDS = int(os.getenv("RECONNECT_DELAY_SECONDS", "8"))
+RECONNECT_MAX_ATTEMPTS = int(os.getenv("RECONNECT_MAX_ATTEMPTS", "0"))
 
 if not API_ID or not API_HASH or not BOT_TOKEN:
     raise RuntimeError("Set API_ID, API_HASH and BOT_TOKEN in environment variables.")
 
 Path(SESSION_DIR).mkdir(parents=True, exist_ok=True)
+
+
+def parse_privileged_users(raw: str) -> Set[int]:
+    result: Set[int] = set()
+    if not raw.strip():
+        return result
+    for chunk in raw.split(","):
+        item = chunk.strip()
+        if not item:
+            continue
+        try:
+            result.add(int(item))
+        except ValueError:
+            logger.warning("Ignored invalid user id in PRIVILEGED_USER_IDS: %s", item)
+    return result
+
+
+PRIVILEGED_USER_IDS = parse_privileged_users(PRIVILEGED_USER_IDS_RAW)
 
 
 @dataclass
@@ -84,6 +106,7 @@ class MusicQueue:
 queue = MusicQueue()
 current_track: Dict[int, Track] = {}
 active_calls: Dict[int, bool] = {}
+reconnect_tasks: Dict[int, asyncio.Task] = {}
 
 
 def format_duration(seconds: Optional[int]) -> str:
@@ -124,36 +147,78 @@ def search_track(query: str, requested_by: str) -> Track:
     )
 
 
-async def start_or_enqueue(chat_id: int, track: Track, calls: PyTgCalls) -> str:
+async def start_or_enqueue(chat_id: int, track: Track, calls: PyTgCalls, bot: Client) -> str:
     position = await queue.push(chat_id, track)
     if active_calls.get(chat_id):
-        return f"Added to queue #{position}: {track.title}"
+        return f"Добавлено в очередь #{position}: {track.title}"
 
     next_track = await queue.peek(chat_id)
     if not next_track:
-        return "Queue is empty."
+        return "Очередь пуста."
 
     try:
-        await calls.play(
-            chat_id,
-            MediaStream(
-                AudioPiped(next_track.direct_url),
-                audio_parameters=AudioQuality.HIGH,
-            ),
-        )
+        await play_track(calls, chat_id, next_track)
     except Exception as exc:
         logger.exception("Failed to start call in chat %s", chat_id)
+        active_calls[chat_id] = True
+        current_track[chat_id] = next_track
+        ensure_reconnect(chat_id, calls, bot)
         return (
-            "Failed to start playback. Ensure group voice chat is already active and userbot can join it.\n"
-            f"Error: {exc}"
+            "Не удалось начать воспроизведение, запускаю реконнект. Проверьте, что голосовой чат запущен и userbot имеет доступ.\n"
+            f"Ошибка: {exc}"
         )
 
     active_calls[chat_id] = True
     current_track[chat_id] = next_track
     return (
-        f"Now playing: {next_track.title} ({format_duration(next_track.duration)})\n"
-        f"Source: {next_track.webpage_url or 'n/a'}"
+        f"Сейчас играет: {next_track.title} ({format_duration(next_track.duration)})\n"
+        f"Источник: {next_track.webpage_url or 'n/a'}"
     )
+
+
+async def play_track(calls: PyTgCalls, chat_id: int, track: Track) -> None:
+    await calls.play(
+        chat_id,
+        MediaStream(
+            AudioPiped(track.direct_url),
+            audio_parameters=AudioQuality.HIGH,
+        ),
+    )
+
+
+async def reconnect_worker(chat_id: int, calls: PyTgCalls, bot: Client) -> None:
+    attempt = 0
+    try:
+        while active_calls.get(chat_id):
+            track = current_track.get(chat_id)
+            if not track:
+                return
+
+            attempt += 1
+            if RECONNECT_MAX_ATTEMPTS > 0 and attempt > RECONNECT_MAX_ATTEMPTS:
+                await bot.send_message(
+                    chat_id,
+                    "Реконнект не удался: превышено число попыток. Используйте /play снова.",
+                )
+                active_calls[chat_id] = False
+                return
+
+            try:
+                await play_track(calls, chat_id, track)
+                await bot.send_message(chat_id, "Реконнект выполнен, воспроизведение восстановлено.")
+                return
+            except Exception as exc:
+                logger.warning("Reconnect attempt %s failed for chat %s: %s", attempt, chat_id, exc)
+                await asyncio.sleep(RECONNECT_DELAY_SECONDS)
+    finally:
+        reconnect_tasks.pop(chat_id, None)
+
+
+def ensure_reconnect(chat_id: int, calls: PyTgCalls, bot: Client) -> None:
+    task = reconnect_tasks.get(chat_id)
+    if task and not task.done():
+        return
+    reconnect_tasks[chat_id] = asyncio.create_task(reconnect_worker(chat_id, calls, bot))
 
 
 async def play_next(chat_id: int, calls: PyTgCalls, bot: Client) -> None:
@@ -167,26 +232,41 @@ async def play_next(chat_id: int, calls: PyTgCalls, bot: Client) -> None:
         except Exception:
             logger.warning("Failed to leave call in %s", chat_id)
         try:
-            await bot.send_message(chat_id, "Queue ended. Left voice chat.")
+            await bot.send_message(chat_id, "Очередь закончилась, вышел из звонка.")
         except Exception:
-            logger.warning("Failed to notify chat %s", chat_id)
+            logger.warning("Failed to send end message to %s", chat_id)
         return
 
     try:
-        await calls.play(
-            chat_id,
-            MediaStream(
-                AudioPiped(nxt.direct_url),
-                audio_parameters=AudioQuality.HIGH,
-            ),
-        )
+        await play_track(calls, chat_id, nxt)
         current_track[chat_id] = nxt
         await bot.send_message(
             chat_id,
-            f"Next track: {nxt.title} ({format_duration(nxt.duration)})",
+            f"Следующий трек: {nxt.title} ({format_duration(nxt.duration)})",
         )
-    except Exception:
+    except Exception as exc:
         logger.exception("Failed to play next track in chat %s", chat_id)
+        await bot.send_message(
+            chat_id,
+            f"Проблема с воспроизведением, запускаю реконнект. Ошибка: {exc}",
+        )
+        ensure_reconnect(chat_id, calls, bot)
+
+
+async def is_privileged_user(bot: Client, m: Message) -> bool:
+    if not m.from_user:
+        return False
+    user_id = m.from_user.id
+    if user_id in PRIVILEGED_USER_IDS:
+        return True
+    try:
+        member = await bot.get_chat_member(m.chat.id, user_id)
+    except Exception:
+        return False
+    return member.status in {
+        ChatMemberStatus.OWNER,
+        ChatMemberStatus.ADMINISTRATOR,
+    }
 
 
 def build_clients() -> tuple[Client, Client, PyTgCalls]:
@@ -196,6 +276,7 @@ def build_clients() -> tuple[Client, Client, PyTgCalls]:
         api_hash=API_HASH,
         bot_token=BOT_TOKEN,
     )
+
     user_session_path = str(Path(SESSION_DIR) / SESSION_NAME)
     user_client = Client(
         name=user_session_path,
@@ -217,14 +298,16 @@ def main() -> None:
     @bot.on_message(filters.command("start"))
     async def start_cmd(_, m: Message):
         await m.reply_text(
-            "Music bot is ready.\n"
-            "Commands:\n"
-            "/play <query>\n"
+            "Музыкальный бот готов.\n"
+            "Команды:\n"
+            "/play <название>\n"
             "/skip\n"
             "/queue\n"
             "/stop\n"
+            "/reconnect\n"
             "/now\n"
-            "/ping"
+            "/ping\n\n"
+            "Пропуск (/skip) доступен только админам или ID из PRIVILEGED_USER_IDS."
         )
 
     @bot.on_message(filters.command("ping"))
@@ -234,50 +317,64 @@ def main() -> None:
     @bot.on_message(filters.command("play") & filters.group)
     async def play_cmd(_, m: Message):
         if len(m.command) < 2:
-            await m.reply_text("Usage: /play <track name>")
+            await m.reply_text("Использование: /play <название трека>")
             return
         query = " ".join(m.command[1:]).strip()
-        await m.reply_text(f"Searching: {query}")
+        await m.reply_text(f"Ищу: {query}")
         try:
             requested_by = m.from_user.mention if m.from_user else "unknown"
             track = await asyncio.to_thread(search_track, query, requested_by)
-            status = await start_or_enqueue(m.chat.id, track, calls)
+            status = await start_or_enqueue(m.chat.id, track, calls, bot)
             await m.reply_text(status)
         except Exception as exc:
-            await m.reply_text(f"Search/add failed: {exc}")
+            await m.reply_text(f"Ошибка поиска/добавления: {exc}")
 
     @bot.on_message(filters.command("skip") & filters.group)
     async def skip_cmd(_, m: Message):
+        if not await is_privileged_user(bot, m):
+            await m.reply_text("Недостаточно прав для /skip.")
+            return
         if not active_calls.get(m.chat.id):
-            await m.reply_text("Nothing is currently playing.")
+            await m.reply_text("Сейчас ничего не играет.")
             return
         await play_next(m.chat.id, calls, bot)
-        await m.reply_text("Skipped.")
+        await m.reply_text("Трек пропущен.")
+
+    @bot.on_message(filters.command("reconnect") & filters.group)
+    async def reconnect_cmd(_, m: Message):
+        if not await is_privileged_user(bot, m):
+            await m.reply_text("Недостаточно прав для /reconnect.")
+            return
+        if not active_calls.get(m.chat.id) or not current_track.get(m.chat.id):
+            await m.reply_text("Нет активного трека для реконнекта.")
+            return
+        ensure_reconnect(m.chat.id, calls, bot)
+        await m.reply_text("Запущен реконнект.")
 
     @bot.on_message(filters.command("queue") & filters.group)
     async def queue_cmd(_, m: Message):
         items = await queue.list(m.chat.id)
         if not items:
-            await m.reply_text("Queue is empty.")
+            await m.reply_text("Очередь пуста.")
             return
-        lines = ["Queue:"]
+        lines = ["Очередь:"]
         for i, tr in enumerate(items[:20], start=1):
             lines.append(f"{i}. {tr.title} [{format_duration(tr.duration)}]")
         if len(items) > 20:
-            lines.append(f"... and {len(items) - 20} more")
+            lines.append(f"... и еще {len(items) - 20}")
         await m.reply_text("\n".join(lines))
 
     @bot.on_message(filters.command("now") & filters.group)
     async def now_cmd(_, m: Message):
         tr = current_track.get(m.chat.id)
         if not tr:
-            await m.reply_text("Nothing is currently playing.")
+            await m.reply_text("Сейчас ничего не играет.")
             return
         await m.reply_text(
-            f"Now playing: {tr.title}\n"
-            f"Duration: {format_duration(tr.duration)}\n"
-            f"Source: {tr.webpage_url or 'n/a'}\n"
-            f"Requested by: {tr.requested_by}"
+            f"Сейчас играет: {tr.title}\n"
+            f"Длительность: {format_duration(tr.duration)}\n"
+            f"Источник: {tr.webpage_url or 'n/a'}\n"
+            f"Запросил: {tr.requested_by}"
         )
 
     @bot.on_message(filters.command("stop") & filters.group)
@@ -285,11 +382,14 @@ def main() -> None:
         await queue.clear(m.chat.id)
         active_calls[m.chat.id] = False
         current_track.pop(m.chat.id, None)
+        task = reconnect_tasks.get(m.chat.id)
+        if task and not task.done():
+            task.cancel()
         try:
             await calls.leave_group_call(m.chat.id)
         except Exception:
             logger.warning("Failed to leave call in %s", m.chat.id)
-        await m.reply_text("Stopped playback and cleared queue.")
+        await m.reply_text("Остановлено, очередь очищена, вышел из звонка.")
 
     user.start()
     calls.start()
