@@ -9,7 +9,24 @@ from dotenv import load_dotenv
 from pyrogram import Client, filters
 from pyrogram.enums import ChatMemberStatus, ChatType
 from pyrogram.types import Message
+
+# Compatibility shim for newer Pyrogram versions.
+try:
+    import pyrogram.errors as pyrogram_errors
+
+    if not hasattr(pyrogram_errors, "GroupcallForbidden") and hasattr(
+        pyrogram_errors, "GroupCallForbidden"
+    ):
+        pyrogram_errors.GroupcallForbidden = pyrogram_errors.GroupCallForbidden
+except Exception:
+    pass
+
 from pytgcalls import PyTgCalls
+
+try:
+    from pytgcalls.types.input_stream import AudioPiped
+except Exception:
+    AudioPiped = None
 from yt_dlp import YoutubeDL
 
 try:
@@ -180,7 +197,8 @@ async def start_or_enqueue(chat_id: int, track: Track, calls: PyTgCalls, bot: Cl
 
 
 async def play_track(calls: PyTgCalls, chat_id: int, track: Track) -> None:
-    await calls.play(chat_id, track.direct_url)
+    stream = AudioPiped(track.direct_url) if AudioPiped else track.direct_url
+    await calls.play(chat_id, stream)
 
 
 async def reconnect_worker(chat_id: int, calls: PyTgCalls, bot: Client) -> None:
