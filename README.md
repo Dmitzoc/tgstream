@@ -1,6 +1,7 @@
 # Telegram Music Stream Bot (voice chat, VPS-ready)
 
 Бот ищет музыку по названию и стримит ее в групповой звонок Telegram.
+English version: README.en.md
 
 ## Принцип работы
 
