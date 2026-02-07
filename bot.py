@@ -131,6 +131,24 @@ queue = MusicQueue()
 current_track: Dict[int, Track] = {}
 active_calls: Dict[int, bool] = {}
 reconnect_tasks: Dict[int, asyncio.Task] = {}
+paused_calls: Set[int] = set()
+
+
+HELP_TEXT = (
+    "Музыкальный бот готов.\n"
+    "Команды:\n"
+    "/play <название>\n"
+    "/pause\n"
+    "/resume\n"
+    "/skip\n"
+    "/queue\n"
+    "/stop\n"
+    "/reconnect\n"
+    "/now\n"
+    "/ping\n"
+    "/POMOGITE\n\n"
+    "Пропуск (/skip) и /reconnect доступны только администраторам или ID из PRIVILEGED_USER_IDS."
+)
 
 
 def format_duration(seconds: Optional[int]) -> str:
@@ -264,6 +282,45 @@ async def play_track(calls: PyTgCalls, user: Client, chat_id: int, track: Track)
     await ensure_user_peer(user, chat_id)
     stream = AudioPiped(track.direct_url) if AudioPiped else track.direct_url
     await calls.play(chat_id, stream)
+    if chat_id in paused_calls:
+        try:
+            await pause_stream(calls, chat_id)
+        except Exception as exc:
+            logger.warning("Failed to re-apply pause for chat %s: %s", chat_id, exc)
+            paused_calls.discard(chat_id)
+
+
+async def _call_with_fallback(calls: PyTgCalls, chat_id: int, names: tuple[str, ...]) -> None:
+    for name in names:
+        method = getattr(calls, name, None)
+        if callable(method):
+            await method(chat_id)
+            return
+    raise RuntimeError("This PyTgCalls version does not support pause/resume.")
+
+
+async def pause_stream(calls: PyTgCalls, chat_id: int) -> None:
+    await _call_with_fallback(
+        calls,
+        chat_id,
+        ("pause_stream", "pause", "pause_call", "pause_group_call"),
+    )
+
+
+async def resume_stream(calls: PyTgCalls, chat_id: int) -> None:
+    await _call_with_fallback(
+        calls,
+        chat_id,
+        ("resume_stream", "resume", "resume_call", "resume_group_call"),
+    )
+
+
+async def leave_call(calls: PyTgCalls, chat_id: int) -> None:
+    await _call_with_fallback(
+        calls,
+        chat_id,
+        ("leave_group_call", "leave_call", "leave"),
+    )
 
 
 async def reconnect_worker(chat_id: int, calls: PyTgCalls, bot: Client, user: Client) -> None:
@@ -317,8 +374,9 @@ async def play_next(chat_id: int, calls: PyTgCalls, bot: Client, user: Client) -
     if not nxt:
         active_calls[chat_id] = False
         current_track.pop(chat_id, None)
+        paused_calls.discard(chat_id)
         try:
-            await calls.leave_group_call(chat_id)
+            await leave_call(calls, chat_id)
         except Exception:
             logger.warning("Failed to leave call in %s", chat_id)
         try:
@@ -402,18 +460,11 @@ def main() -> None:
 
     @bot.on_message(filters.command("start"))
     async def start_cmd(_, m: Message):
-        await m.reply_text(
-            "Музыкальный бот готов.\n"
-            "Команды:\n"
-            "/play <название>\n"
-            "/skip\n"
-            "/queue\n"
-            "/stop\n"
-            "/reconnect\n"
-            "/now\n"
-            "/ping\n\n"
-            "Пропуск (/skip) доступен только админам или ID из PRIVILEGED_USER_IDS."
-        )
+        await m.reply_text(HELP_TEXT)
+
+    @bot.on_message(filters.command(["POMOGITE", "pomogite"]))
+    async def help_cmd(_, m: Message):
+        await m.reply_text(HELP_TEXT)
 
     @bot.on_message(filters.command("ping"))
     async def ping_cmd(_, m: Message):
@@ -457,6 +508,40 @@ def main() -> None:
             return
         await play_next(m.chat.id, calls, bot, user)
         await m.reply_text("Трек пропущен.")
+
+    @bot.on_message(filters.command("pause"))
+    async def pause_cmd(_, m: Message):
+        if not await ensure_group_context(m):
+            return
+        if not active_calls.get(m.chat.id):
+            await m.reply_text("Сейчас ничего не играет.")
+            return
+        if m.chat.id in paused_calls:
+            await m.reply_text("Уже на паузе.")
+            return
+        try:
+            await pause_stream(calls, m.chat.id)
+            paused_calls.add(m.chat.id)
+            await m.reply_text("Пауза.")
+        except Exception as exc:
+            await m.reply_text(f"Не удалось поставить на паузу: {exc}")
+
+    @bot.on_message(filters.command(["resume", "unpause"]))
+    async def resume_cmd(_, m: Message):
+        if not await ensure_group_context(m):
+            return
+        if not active_calls.get(m.chat.id):
+            await m.reply_text("Сейчас ничего не играет.")
+            return
+        if m.chat.id not in paused_calls:
+            await m.reply_text("Воспроизведение не на паузе.")
+            return
+        try:
+            await resume_stream(calls, m.chat.id)
+            paused_calls.discard(m.chat.id)
+            await m.reply_text("Продолжено.")
+        except Exception as exc:
+            await m.reply_text(f"Не удалось возобновить: {exc}")
 
     @bot.on_message(filters.command("reconnect"))
     async def reconnect_cmd(_, m: Message):
@@ -508,11 +593,12 @@ def main() -> None:
         await queue.clear(m.chat.id)
         active_calls[m.chat.id] = False
         current_track.pop(m.chat.id, None)
+        paused_calls.discard(m.chat.id)
         task = reconnect_tasks.get(m.chat.id)
         if task and not task.done():
             task.cancel()
         try:
-            await calls.leave_group_call(m.chat.id)
+            await leave_call(calls, m.chat.id)
         except Exception:
             logger.warning("Failed to leave call in %s", m.chat.id)
         await m.reply_text("Остановлено, очередь очищена, вышел из звонка.")
