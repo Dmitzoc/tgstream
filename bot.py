@@ -10,14 +10,18 @@ from pyrogram import Client, filters
 from pyrogram.enums import ChatMemberStatus, ChatType
 from pyrogram.types import Message
 
-# Compatibility shim for newer Pyrogram versions.
+# Compatibility shim for Pyrogram error name changes.
 try:
     import pyrogram.errors as pyrogram_errors
 
-    if not hasattr(pyrogram_errors, "GroupcallForbidden") and hasattr(
-        pyrogram_errors, "GroupCallForbidden"
-    ):
-        pyrogram_errors.GroupcallForbidden = pyrogram_errors.GroupCallForbidden
+    if not hasattr(pyrogram_errors, "GroupcallForbidden"):
+        if hasattr(pyrogram_errors, "GroupCallForbidden"):
+            pyrogram_errors.GroupcallForbidden = pyrogram_errors.GroupCallForbidden
+        else:
+            class GroupcallForbidden(Exception):
+                pass
+
+            pyrogram_errors.GroupcallForbidden = GroupcallForbidden
 except Exception:
     pass
 
