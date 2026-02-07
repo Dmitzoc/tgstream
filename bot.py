@@ -143,6 +143,67 @@ def format_duration(seconds: Optional[int]) -> str:
     return f"{m}:{s:02d}"
 
 
+def is_peer_invalid_error(exc: Exception) -> bool:
+    msg = str(exc).lower()
+    return (
+        "peer id invalid" in msg
+        or "channel private" in msg
+        or "channel_private" in msg
+        or "chat id invalid" in msg
+        or "chat_id_invalid" in msg
+    )
+
+
+def is_groupcall_forbidden(exc: Exception) -> bool:
+    msg = str(exc).lower()
+    return "groupcallforbidden" in msg or "group call forbidden" in msg or "groupcall_forbidden" in msg
+
+
+def is_voice_chat_missing(exc: Exception) -> bool:
+    msg = str(exc).lower()
+    return (
+        "groupcall not found" in msg
+        or "groupcallnotfound" in msg
+        or "group call not found" in msg
+        or "voice chat not found" in msg
+        or "voice chat not started" in msg
+        or "groupcall_not_found" in msg
+    )
+
+
+def explain_play_error(exc: Exception) -> str:
+    if is_peer_invalid_error(exc):
+        return (
+            "Userbot cannot access this group. Add the user account to the group and open the chat at least once, "
+            "then retry /play."
+        )
+    if is_groupcall_forbidden(exc):
+        return (
+            "Userbot is not allowed to start/join the voice chat. Start the voice chat manually or grant the "
+            "'Manage video chats' permission to the user account."
+        )
+    if is_voice_chat_missing(exc):
+        return "Voice chat is not started. Start the voice chat and retry /play."
+    return "Failed to start playback. Please ensure the voice chat is started and try again."
+
+
+def preload_user_dialogs(user: Client) -> None:
+    try:
+        for _ in user.get_dialogs():
+            pass
+        logger.info("User dialogs preloaded.")
+    except Exception as exc:
+        logger.warning("Failed to preload user dialogs: %s", exc)
+
+
+async def ensure_user_peer(user: Client, chat_id: int) -> None:
+    try:
+        await user.get_chat(chat_id)
+    except Exception as exc:
+        logger.warning("Userbot cannot access chat %s: %s", chat_id, exc)
+        raise
+
+
 def search_track(query: str, requested_by: str) -> Track:
     ydl_opts = {
         "format": "bestaudio[ext=m4a]/bestaudio/best",
@@ -171,7 +232,7 @@ def search_track(query: str, requested_by: str) -> Track:
     )
 
 
-async def start_or_enqueue(chat_id: int, track: Track, calls: PyTgCalls, bot: Client) -> str:
+async def start_or_enqueue(chat_id: int, track: Track, calls: PyTgCalls, bot: Client, user: Client) -> str:
     position = await queue.push(chat_id, track)
     if active_calls.get(chat_id):
         return f"Добавлено в очередь #{position}: {track.title}"
@@ -181,15 +242,14 @@ async def start_or_enqueue(chat_id: int, track: Track, calls: PyTgCalls, bot: Cl
         return "Очередь пуста."
 
     try:
-        await play_track(calls, chat_id, next_track)
+        await play_track(calls, user, chat_id, next_track)
     except Exception as exc:
         logger.exception("Failed to start call in chat %s", chat_id)
         active_calls[chat_id] = True
         current_track[chat_id] = next_track
-        ensure_reconnect(chat_id, calls, bot)
+        ensure_reconnect(chat_id, calls, bot, user)
         return (
-            "Не удалось начать воспроизведение, запускаю реконнект. Проверьте, что голосовой чат запущен и userbot имеет доступ.\n"
-            f"Ошибка: {exc}"
+            f"{explain_play_error(exc)}\nError: {exc}"
         )
 
     active_calls[chat_id] = True
@@ -200,12 +260,13 @@ async def start_or_enqueue(chat_id: int, track: Track, calls: PyTgCalls, bot: Cl
     )
 
 
-async def play_track(calls: PyTgCalls, chat_id: int, track: Track) -> None:
+async def play_track(calls: PyTgCalls, user: Client, chat_id: int, track: Track) -> None:
+    await ensure_user_peer(user, chat_id)
     stream = AudioPiped(track.direct_url) if AudioPiped else track.direct_url
     await calls.play(chat_id, stream)
 
 
-async def reconnect_worker(chat_id: int, calls: PyTgCalls, bot: Client) -> None:
+async def reconnect_worker(chat_id: int, calls: PyTgCalls, bot: Client, user: Client) -> None:
     attempt = 0
     try:
         while active_calls.get(chat_id):
@@ -223,11 +284,18 @@ async def reconnect_worker(chat_id: int, calls: PyTgCalls, bot: Client) -> None:
                 return
 
             try:
-                await play_track(calls, chat_id, track)
+                await play_track(calls, user, chat_id, track)
                 await bot.send_message(chat_id, "Реконнект выполнен, воспроизведение восстановлено.")
                 return
             except Exception as exc:
                 logger.warning("Reconnect attempt %s failed for chat %s: %s", attempt, chat_id, exc)
+                if is_peer_invalid_error(exc):
+                    active_calls[chat_id] = False
+                    try:
+                        await bot.send_message(chat_id, explain_play_error(exc))
+                    except Exception:
+                        logger.warning("Failed to send peer error message to %s", chat_id)
+                    return
                 if "valid stream object" in str(exc) or "stream classes found" in str(exc):
                     active_calls[chat_id] = False
                     return
@@ -236,14 +304,14 @@ async def reconnect_worker(chat_id: int, calls: PyTgCalls, bot: Client) -> None:
         reconnect_tasks.pop(chat_id, None)
 
 
-def ensure_reconnect(chat_id: int, calls: PyTgCalls, bot: Client) -> None:
+def ensure_reconnect(chat_id: int, calls: PyTgCalls, bot: Client, user: Client) -> None:
     task = reconnect_tasks.get(chat_id)
     if task and not task.done():
         return
-    reconnect_tasks[chat_id] = asyncio.create_task(reconnect_worker(chat_id, calls, bot))
+    reconnect_tasks[chat_id] = asyncio.create_task(reconnect_worker(chat_id, calls, bot, user))
 
 
-async def play_next(chat_id: int, calls: PyTgCalls, bot: Client) -> None:
+async def play_next(chat_id: int, calls: PyTgCalls, bot: Client, user: Client) -> None:
     await queue.pop(chat_id)
     nxt = await queue.peek(chat_id)
     if not nxt:
@@ -260,7 +328,7 @@ async def play_next(chat_id: int, calls: PyTgCalls, bot: Client) -> None:
         return
 
     try:
-        await play_track(calls, chat_id, nxt)
+        await play_track(calls, user, chat_id, nxt)
         current_track[chat_id] = nxt
         await bot.send_message(
             chat_id,
@@ -270,9 +338,9 @@ async def play_next(chat_id: int, calls: PyTgCalls, bot: Client) -> None:
         logger.exception("Failed to play next track in chat %s", chat_id)
         await bot.send_message(
             chat_id,
-            f"Проблема с воспроизведением, запускаю реконнект. Ошибка: {exc}",
+            f"{explain_play_error(exc)}\nError: {exc}",
         )
-        ensure_reconnect(chat_id, calls, bot)
+        ensure_reconnect(chat_id, calls, bot, user)
 
 
 async def is_privileged_user(bot: Client, m: Message) -> bool:
@@ -327,10 +395,10 @@ def main() -> None:
     @calls.on_update()
     async def stream_end_handler(_, update):
         if StreamAudioEnded is not None and isinstance(update, StreamAudioEnded):
-            await play_next(update.chat_id, calls, bot)
+            await play_next(update.chat_id, calls, bot, user)
             return
         if update.__class__.__name__ == "StreamAudioEnded" and hasattr(update, "chat_id"):
-            await play_next(update.chat_id, calls, bot)
+            await play_next(update.chat_id, calls, bot, user)
 
     @bot.on_message(filters.command("start"))
     async def start_cmd(_, m: Message):
@@ -358,12 +426,21 @@ def main() -> None:
         if len(m.command) < 2:
             await m.reply_text("Использование: /play <название трека>")
             return
+        try:
+            await ensure_user_peer(user, m.chat.id)
+        except Exception as exc:
+            logger.warning("Userbot peer check failed for chat %s: %s", m.chat.id, exc)
+            await m.reply_text(
+                "Userbot cannot access this group. Add the user account to the group and open the chat at least once, "
+                "then retry /play."
+            )
+            return
         query = " ".join(m.command[1:]).strip()
         await m.reply_text(f"Ищу: {query}")
         try:
             requested_by = m.from_user.mention if m.from_user else "unknown"
             track = await asyncio.to_thread(search_track, query, requested_by)
-            status = await start_or_enqueue(m.chat.id, track, calls, bot)
+            status = await start_or_enqueue(m.chat.id, track, calls, bot, user)
             await m.reply_text(status)
         except Exception as exc:
             await m.reply_text(f"Ошибка поиска/добавления: {exc}")
@@ -378,7 +455,7 @@ def main() -> None:
         if not active_calls.get(m.chat.id):
             await m.reply_text("Сейчас ничего не играет.")
             return
-        await play_next(m.chat.id, calls, bot)
+        await play_next(m.chat.id, calls, bot, user)
         await m.reply_text("Трек пропущен.")
 
     @bot.on_message(filters.command("reconnect"))
@@ -391,7 +468,7 @@ def main() -> None:
         if not active_calls.get(m.chat.id) or not current_track.get(m.chat.id):
             await m.reply_text("Нет активного трека для реконнекта.")
             return
-        ensure_reconnect(m.chat.id, calls, bot)
+        ensure_reconnect(m.chat.id, calls, bot, user)
         await m.reply_text("Запущен реконнект.")
 
     @bot.on_message(filters.command("queue"))
@@ -441,6 +518,7 @@ def main() -> None:
         await m.reply_text("Остановлено, очередь очищена, вышел из звонка.")
 
     user.start()
+    preload_user_dialogs(user)
     calls.start()
     bot.run()
 
