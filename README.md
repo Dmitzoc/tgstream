@@ -23,6 +23,54 @@ English version: README.en.md
 - `BOT_TOKEN` принимает команды
 - userbot (обычный аккаунт Telegram) заходит в голосовой чат и стримит аудио
 
+## Где взять API_ID, API_HASH и BOT_TOKEN
+
+### API_ID и API_HASH (Telegram API)
+
+1. Открой сайт разработчиков Telegram.
+
+```
+https://my.telegram.org
+```
+
+2. Войди под своим Telegram-аккаунтом.
+3. Открой раздел `API development tools`.
+4. Создай приложение: укажи `App title` и `Short name` (любые понятные значения).
+5. Сохрани `API_ID` и `API_HASH` — они нужны в `.env`.
+
+### BOT_TOKEN (бот для команд)
+
+1. В Telegram открой @BotFather.
+2. Отправь команду `/newbot`.
+3. Задай имя и username бота.
+4. Скопируй выданный `BOT_TOKEN` и добавь в `.env`.
+
+### Userbot (обычный аккаунт Telegram)
+
+1. Используй обычный аккаунт Telegram, который будет заходить в голосовой чат.
+2. Добавь этот аккаунт в группу.
+3. Дай ему право входить в голосовой чат (и желательно `Manage video chats`).
+4. При первом запуске нужно создать сессию для этого аккаунта.
+
+## Как создать userbot-сессию
+
+Вариант 1. Через Docker (рекомендуется для VPS):
+
+```bash
+sudo docker-compose run --rm auth
+```
+
+Введи номер телефона, код Telegram и пароль 2FA (если включен).  
+Сессия сохранится в `data/sessions`.
+
+Вариант 2. Локально через Python:
+
+```bash
+python create_session.py
+```
+
+Требуется установленный Python и заполненный `.env`.
+
 ## Команды
 
 - `/play <название>` - поиск и добавление в очередь

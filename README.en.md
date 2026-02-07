@@ -19,6 +19,54 @@ In this project it is already implemented:
 - `BOT_TOKEN` accepts commands
 - the userbot (normal Telegram account) joins the voice chat and streams audio
 
+## Where to get API_ID, API_HASH, and BOT_TOKEN
+
+### API_ID and API_HASH (Telegram API)
+
+1. Open the Telegram developer site.
+
+```
+https://my.telegram.org
+```
+
+2. Log in with your Telegram account.
+3. Open the `API development tools` section.
+4. Create an app: fill `App title` and `Short name` with any clear values.
+5. Save `API_ID` and `API_HASH` and put them into `.env`.
+
+### BOT_TOKEN (command bot)
+
+1. Open @BotFather in Telegram.
+2. Send `/newbot`.
+3. Choose the bot name and username.
+4. Copy the generated `BOT_TOKEN` and put it into `.env`.
+
+### Userbot (normal Telegram account)
+
+1. Use a regular Telegram account that will join the voice chat.
+2. Add this account to the group.
+3. Give it permission to join the voice chat (and ideally `Manage video chats`).
+4. Create a session for this account on the first run.
+
+## How to create a userbot session
+
+Option 1. Using Docker (recommended for VPS):
+
+```bash
+sudo docker-compose run --rm auth
+```
+
+Enter the phone number, Telegram code, and 2FA password (if enabled).  
+The session will be saved to `data/sessions`.
+
+Option 2. Local Python:
+
+```bash
+python create_session.py
+```
+
+Requires Python installed and `.env` filled in.
+
 ## Commands
 
 - `/play <title>` - search and add to queue
